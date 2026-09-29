@@ -1,14 +1,22 @@
-const { BedrockRuntimeClient, ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
+// Modified from SurveyAI by Sameer Shaik (CC BY-NC 4.0): model call goes through
+// ../lib/ai-provider (Claude by default); daily question limit added.
+const { generate } = require('../lib/ai-provider');
 
-const client = new BedrockRuntimeClient({
-  region: 'eu-west-2',
-  credentials: {
-    accessKeyId: process.env.BEDROCK_AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.BEDROCK_AWS_SECRET_ACCESS_KEY,
-  },
-});
+const DAILY_LIMIT = parseInt(process.env.AI_QA_DAILY_LIMIT || '100', 10);
 
-const MODEL_ID = 'amazon.nova-pro-v1:0';
+let dailyCount = 0;
+let lastResetDate = new Date().toISOString().slice(0, 10);
+
+function checkAndIncrementCounter() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== lastResetDate) {
+    dailyCount = 0;
+    lastResetDate = today;
+  }
+  if (dailyCount >= DAILY_LIMIT) return false;
+  dailyCount++;
+  return true;
+}
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -72,26 +80,15 @@ ${reportContext.citations?.length ? `Referenced standards: ${reportContext.citat
 
 USER QUESTION: ${question}`;
 
-    const command = new ConverseCommand({
-      modelId: MODEL_ID,
-      system: [{ text: systemPrompt }],
-      messages: [
-        {
-          role: 'user',
-          content: [{ text: userMessage }],
-        },
-      ],
-      inferenceConfig: {
-        maxTokens: 400,
-      },
-    });
+    if (!checkAndIncrementCounter()) {
+      return {
+        statusCode: 429,
+        headers: CORS_HEADERS,
+        body: JSON.stringify({ error: 'Daily question limit reached. Please try again tomorrow.' }),
+      };
+    }
 
-    const response = await client.send(command);
-
-    const answer = response.output.message.content
-      .filter(b => b.text)
-      .map(b => b.text)
-      .join('');
+    const answer = await generate({ system: systemPrompt, text: userMessage, maxTokens: 400 });
 
     return {
       statusCode: 200,
@@ -102,7 +99,7 @@ USER QUESTION: ${question}`;
   } catch (err) {
     console.error('[qa] Error:', err);
     return {
-      statusCode: 500,
+      statusCode: err.statusCode || 500,
       headers: CORS_HEADERS,
       body: JSON.stringify({ error: err.message }),
     };

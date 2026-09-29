@@ -1,4 +1,6 @@
-const { BedrockRuntimeClient, ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
+// Modified from SurveyAI by Sameer Shaik (CC BY-NC 4.0): model calls go through
+// ../lib/ai-provider (Claude by default); env names made provider-neutral.
+const { generate } = require('../lib/ai-provider');
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -6,16 +8,7 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 };
 
-const client = new BedrockRuntimeClient({
-  region: 'eu-west-2',
-  credentials: {
-    accessKeyId: process.env.BEDROCK_AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.BEDROCK_AWS_SECRET_ACCESS_KEY,
-  },
-});
-
-const MODEL_ID = 'amazon.nova-pro-v1:0';
-const DAILY_LIMIT = parseInt(process.env.BEDROCK_DAILY_LIMIT || '30', 10);
+const DAILY_LIMIT = parseInt(process.env.AI_DAILY_LIMIT || process.env.BEDROCK_DAILY_LIMIT || '30', 10);
 
 let dailyCount = 0;
 let lastResetDate = new Date().toISOString().slice(0, 10);
@@ -348,43 +341,16 @@ function cleanJson(text) {
     .trim();
 }
 
-async function runVisionStep(imageBuffer, mediaType, context, isRetry = false) {
+async function runVisionStep(imageBase64, mediaType, context, isRetry = false) {
   const retryPrefix = isRetry
     ? 'CRITICAL: Your previous response failed JSON validation. Return ONLY raw JSON. No markdown, no backticks, no explanation. The JSON must exactly match the schema provided.\n\n'
     : '';
 
-  const command = new ConverseCommand({
-    modelId: MODEL_ID,
-    messages: [
-      {
-        role: 'user',
-        content: [
-          {
-            image: {
-              format: mediaType === 'image/png' ? 'png' : mediaType === 'image/webp' ? 'webp' : 'jpeg',
-              source: {
-                bytes: imageBuffer,
-              },
-            },
-          },
-          {
-            text: retryPrefix + buildAnalystPrompt(context),
-          },
-        ],
-      },
-    ],
-    inferenceConfig: {
-      maxTokens: 3000,
-    },
+  return generate({
+    image: { base64: imageBase64, mediaType },
+    text: retryPrefix + buildAnalystPrompt(context),
+    maxTokens: 3000,
   });
-
-  const response = await client.send(command);
-  const rawText = response.output.message.content
-    .filter(b => b.text)
-    .map(b => b.text)
-    .join('');
-
-  return rawText;
 }
 
 async function runWriterStep(analysisJson) {
@@ -434,26 +400,7 @@ STYLE REQUIREMENTS:
 ANALYSIS DATA:
 ${JSON.stringify(analysisJson, null, 2)}`;
 
-  const command = new ConverseCommand({
-    modelId: MODEL_ID,
-    messages: [
-      {
-        role: 'user',
-        content: [{ text: writerPrompt }],
-      },
-    ],
-    inferenceConfig: {
-      maxTokens: 2000,
-    },
-  });
-
-  const response = await client.send(command);
-  const reportText = response.output.message.content
-    .filter(b => b.text)
-    .map(b => b.text)
-    .join('');
-
-  return reportText;
+  return generate({ text: writerPrompt, maxTokens: 2000 });
 }
 
 exports.handler = async (event) => {
@@ -466,7 +413,8 @@ exports.handler = async (event) => {
   }
 
   const apiKey = event.headers['x-api-key'] || event.headers['X-Api-Key'];
-  if (!apiKey || apiKey !== process.env.BEDROCK_API_SECRET_KEY) {
+  const expectedKey = process.env.APP_API_SECRET_KEY || process.env.BEDROCK_API_SECRET_KEY;
+  if (!apiKey || apiKey !== expectedKey) {
     return { statusCode: 401, headers: CORS_HEADERS, body: JSON.stringify({ error: 'Unauthorized' }) };
   }
 
@@ -496,23 +444,21 @@ exports.handler = async (event) => {
     const validMediaTypes = ['image/jpeg', 'image/png', 'image/webp'];
     const resolvedMediaType = validMediaTypes.includes(mediaType) ? mediaType : 'image/jpeg';
 
-    const imageBuffer = Buffer.from(imageBase64, 'base64');
-
-    let rawText = await runVisionStep(imageBuffer, resolvedMediaType, context, false);
+    let rawText = await runVisionStep(imageBase64, resolvedMediaType, context, false);
     let clean = cleanJson(rawText);
 
     let analysis;
     try {
       analysis = JSON.parse(clean);
     } catch {
-      rawText = await runVisionStep(imageBuffer, resolvedMediaType, context, true);
+      rawText = await runVisionStep(imageBase64, resolvedMediaType, context, true);
       clean = cleanJson(rawText);
       analysis = JSON.parse(clean);
     }
 
     const validationErrors = validateReport(analysis);
     if (validationErrors.length > 0 && !analysis.severity) {
-      rawText = await runVisionStep(imageBuffer, resolvedMediaType, context, true);
+      rawText = await runVisionStep(imageBase64, resolvedMediaType, context, true);
       clean = cleanJson(rawText);
       analysis = JSON.parse(clean);
     }
@@ -528,7 +474,7 @@ exports.handler = async (event) => {
   } catch (err) {
     console.error('[bedrock-analyze] Error:', err);
     return {
-      statusCode: 500,
+      statusCode: err.statusCode || 500,
       headers: CORS_HEADERS,
       body: JSON.stringify({ error: err.message || 'Internal server error' }),
     };
